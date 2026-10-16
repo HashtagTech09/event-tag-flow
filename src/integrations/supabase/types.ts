@@ -1086,9 +1086,39 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      view_consolidated_event_revenue: {
+        Row: {
+          booking_source: string | null
+          coin_revenue_inr: number | null
+          created_at: string | null
+          gross_amount_inr: number | null
+          hold_is_live: boolean | null
+          is_paid: boolean | null
+          is_pending: boolean | null
+          order_date_ist: string | null
+          order_id: string | null
+          package_keys: string[] | null
+          paid_at: string | null
+          parent_order_id: string | null
+          payment_method: string | null
+          payment_status: string | null
+          recognised_revenue_inr: number | null
+          ticket_revenue_inr: number | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
+      get_consolidated_event_revenue: {
+        Args: {
+          p_date_from?: string | null
+          p_date_to?: string | null
+          p_package_key?: string | null
+          p_payment_status?: string | null
+          p_payment_method?: string | null
+        }
+        Returns: Json
+      }
       get_dare_board_progress: {
         Args: { p_before_created_at?: string; p_before_id?: string }
         Returns: Json
