@@ -8,6 +8,7 @@ import {
   jsonResponse,
   makeCashfreeOrderId,
 } from "../_shared/cashfree.ts";
+import { OrderPricingError, assertOrderPricedFromCatalog } from "../_shared/orderPricing.ts";
 
 const BRAND_NAME = "Pink'd";
 const BRAND_COLOR = "#ff007f";
@@ -43,6 +44,9 @@ serve(async (req: Request) => {
       return jsonResponse({ error: "This order is already paid" }, 409);
     }
 
+    // Amount is re-derived from the catalog; the request body is never consulted for money.
+    const pricing = await assertOrderPricedFromCatalog(supabase, order.id);
+
     const config = getCashfreeConfig();
     const cashfreeOrderId = order.cashfree_order_id || makeCashfreeOrderId(order.id);
 
@@ -67,7 +71,7 @@ serve(async (req: Request) => {
       },
       body: JSON.stringify({
         order_id: cashfreeOrderId,
-        order_amount: Number(order.total_amount_inr),
+        order_amount: pricing.total_inr,
         order_currency: "INR",
         customer_details: {
           customer_id: order.id,
@@ -119,6 +123,10 @@ serve(async (req: Request) => {
       mode: config.mode,
     });
   } catch (error) {
+    if (error instanceof OrderPricingError) {
+      console.warn("cashfree-create-order refused: order pricing mismatch", { code: error.code });
+      return jsonResponse({ error: error.message, code: error.code }, error.status);
+    }
     console.error("cashfree-create-order failed:", error);
     return jsonResponse({ error: error instanceof Error ? error.message : "Cashfree setup failed" }, 500);
   }

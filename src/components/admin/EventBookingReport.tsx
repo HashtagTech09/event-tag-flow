@@ -21,7 +21,7 @@ type EventOrder = Tables<"event_orders"> & {
   event_order_attendees?: EventOrderAttendee[] | null;
 };
 
-const COINS_SOURCE = "coins_page";
+const REPORT_TIME_ZONE = "Asia/Kolkata";
 const ORDER_SELECT_WITH_ATTENDEES = "*, event_order_items(*), event_order_attendees(*)";
 const ORDER_SELECT_BASIC = "*, event_order_items(*)";
 
@@ -37,6 +37,75 @@ const PAYMENT_METHOD_LABELS: Record<string, string> = {
 const SUCCESS_STATUSES = new Set(["paid", "completed"]);
 const PENDING_STATUSES = new Set(["pending", "manual_payment"]);
 const PAYMENT_STATUSES = ["manual_payment", "pending", "paid", "completed", "failed", "cancelled", "refunded"];
+
+// Mirrors view_consolidated_event_revenue: one row per order, revenue partitioned
+// by booking source (ticket vs coin). Payment method is a breakdown of the same money.
+type RevenueSummary = {
+  total_orders: number;
+  successful_payments: number;
+  pending_payments: number;
+  ticket_revenue_inr: number;
+  coin_revenue_inr: number;
+  recognised_revenue_inr: number;
+  pending_amount_inr: number;
+  by_payment_method: Array<{ payment_method: string; orders: number; paid_orders: number; revenue_inr: number }>;
+  by_package: Array<{
+    package_key: string;
+    package_name: string;
+    package_category: string;
+    quantity: number;
+    booking_value_inr: number;
+    revenue_inr: number;
+  }>;
+};
+
+const EMPTY_SUMMARY: RevenueSummary = {
+  total_orders: 0,
+  successful_payments: 0,
+  pending_payments: 0,
+  ticket_revenue_inr: 0,
+  coin_revenue_inr: 0,
+  recognised_revenue_inr: 0,
+  pending_amount_inr: 0,
+  by_payment_method: [],
+  by_package: [],
+};
+
+function parseRevenueSummary(value: Json | null): RevenueSummary {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return EMPTY_SUMMARY;
+  const raw = value as Record<string, Json | undefined>;
+  const num = (key: keyof RevenueSummary) => Number(raw[key] ?? 0);
+  const list = <T,>(key: keyof RevenueSummary) => (Array.isArray(raw[key]) ? (raw[key] as unknown as T[]) : []);
+  return {
+    total_orders: num("total_orders"),
+    successful_payments: num("successful_payments"),
+    pending_payments: num("pending_payments"),
+    ticket_revenue_inr: num("ticket_revenue_inr"),
+    coin_revenue_inr: num("coin_revenue_inr"),
+    recognised_revenue_inr: num("recognised_revenue_inr"),
+    pending_amount_inr: num("pending_amount_inr"),
+    by_payment_method: list<RevenueSummary["by_payment_method"][number]>("by_payment_method").map((row) => ({
+      payment_method: String(row.payment_method || "manual"),
+      orders: Number(row.orders || 0),
+      paid_orders: Number(row.paid_orders || 0),
+      revenue_inr: Number(row.revenue_inr || 0),
+    })),
+    by_package: list<RevenueSummary["by_package"][number]>("by_package").map((row) => ({
+      package_key: String(row.package_key || ""),
+      package_name: String(row.package_name || row.package_key || ""),
+      package_category: String(row.package_category || ""),
+      quantity: Number(row.quantity || 0),
+      booking_value_inr: Number(row.booking_value_inr || 0),
+      revenue_inr: Number(row.revenue_inr || 0),
+    })),
+  };
+}
+
+// The summary RPC filters on the order's IST calendar date; the order list must agree.
+function orderDateIst(createdAt: string | null) {
+  if (!createdAt) return "";
+  return new Date(createdAt).toLocaleDateString("en-CA", { timeZone: REPORT_TIME_ZONE });
+}
 
 function paymentMethod(provider: string | null) {
   return provider?.trim().toLowerCase() || "manual";
@@ -130,7 +199,9 @@ function exportCsv(filename: string, headers: string[], rows: Array<Array<string
 export default function EventBookingReport() {
   const { toast } = useToast();
   const [orders, setOrders] = useState<EventOrder[]>([]);
+  const [summary, setSummary] = useState<RevenueSummary>(EMPTY_SUMMARY);
   const [isLoading, setIsLoading] = useState(true);
+  const [isSummaryLoading, setIsSummaryLoading] = useState(true);
   const [updatingOrderId, setUpdatingOrderId] = useState<string | null>(null);
   const [isExpiring, setIsExpiring] = useState(false);
   const [packageFilter, setPackageFilter] = useState(ALL_PACKAGES);
@@ -174,9 +245,44 @@ export default function EventBookingReport() {
     }
   }, [toast]);
 
+  // Money is totalled in the database (view_consolidated_event_revenue) under the
+  // same filters as the list below, so the client never re-adds revenue streams.
+  const fetchSummary = useCallback(async () => {
+    try {
+      setIsSummaryLoading(true);
+      const { data, error } = await supabase.rpc("get_consolidated_event_revenue", {
+        p_date_from: dateFrom || null,
+        p_date_to: dateTo || null,
+        p_package_key: packageFilter === ALL_PACKAGES ? null : packageFilter,
+        p_payment_status: statusFilter === ALL_STATUSES ? null : statusFilter,
+        p_payment_method: methodFilter === ALL_METHODS ? null : methodFilter,
+      });
+      if (error) throw error;
+      setSummary(parseRevenueSummary(data));
+    } catch (error) {
+      console.error("Event revenue summary failed:", error);
+      setSummary(EMPTY_SUMMARY);
+      toast({
+        title: "Revenue Summary Failed",
+        description: "Could not load the consolidated revenue totals.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSummaryLoading(false);
+    }
+  }, [dateFrom, dateTo, methodFilter, packageFilter, statusFilter, toast]);
+
   useEffect(() => {
     fetchOrders();
   }, [fetchOrders]);
+
+  useEffect(() => {
+    fetchSummary();
+  }, [fetchSummary]);
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([fetchOrders(), fetchSummary()]);
+  }, [fetchOrders, fetchSummary]);
 
   const expireStaleHolds = async () => {
     try {
@@ -188,7 +294,7 @@ export default function EventBookingReport() {
         title: "Stale Holds Expired",
         description: `Cancelled ${cancelled} abandoned checkout${cancelled === 1 ? "" : "s"}`,
       });
-      await fetchOrders();
+      await refreshAll();
     } catch (error) {
       console.error("Expire stale holds failed:", error);
       toast({
@@ -221,83 +327,22 @@ export default function EventBookingReport() {
 
   const filteredOrders = useMemo(() => {
     return orders.filter((order) => {
-      const orderDate = order.created_at || "";
+      const orderDate = orderDateIst(order.created_at);
       const status = order.payment_status || "pending";
       const packageMatches =
         packageFilter === ALL_PACKAGES || getOrderItems(order).some((item) => item.package_key === packageFilter);
       const statusMatches = statusFilter === ALL_STATUSES || status === statusFilter;
       const methodMatches = methodFilter === ALL_METHODS || paymentMethod(order.payment_provider) === methodFilter;
-      const fromMatches = !dateFrom || orderDate >= `${dateFrom}T00:00:00`;
-      const toMatches = !dateTo || orderDate <= `${dateTo}T23:59:59`;
+      const fromMatches = !dateFrom || orderDate >= dateFrom;
+      const toMatches = !dateTo || orderDate <= dateTo;
       return packageMatches && statusMatches && methodMatches && fromMatches && toMatches;
     });
   }, [dateFrom, dateTo, orders, packageFilter, statusFilter, methodFilter]);
 
-  const stats = useMemo(() => {
-    const packageMap = new Map<
-      string,
-      { name: string; category: string; quantity: number; revenue: number; value: number }
-    >();
-    let ticketRevenue = 0;
-    let coinRevenue = 0;
-    let pendingPayments = 0;
-    let successfulPayments = 0;
-    let cashCollected = 0;
-    let cashOrders = 0;
-
-    filteredOrders.forEach((order) => {
-      const status = order.payment_status || "pending";
-      const orderIsSuccessful = SUCCESS_STATUSES.has(status);
-
-      if (orderIsSuccessful) {
-        if (paymentMethod(order.payment_provider) === "cash") {
-          cashCollected += Number(order.total_amount_inr || 0);
-          cashOrders += 1;
-        }
-        if (order.booking_source === COINS_SOURCE) {
-          coinRevenue += Number(order.total_amount_inr || 0);
-        } else {
-          ticketRevenue += Number(order.total_amount_inr || 0);
-        }
-        successfulPayments += 1;
-      } else if (PENDING_STATUSES.has(status)) {
-        pendingPayments += 1;
-      }
-
-      getOrderItems(order).forEach((item) => {
-        const existing = packageMap.get(item.package_key) || {
-          name: item.package_name || item.package_key,
-          category: item.package_category,
-          quantity: 0,
-          revenue: 0,
-          value: 0,
-        };
-        existing.quantity += item.quantity;
-        existing.value += Number(item.line_total_inr || 0);
-        if (orderIsSuccessful) {
-          existing.revenue += Number(item.line_total_inr || 0);
-        }
-        packageMap.set(item.package_key, existing);
-      });
-    });
-
-    return {
-      totalOrders: filteredOrders.length,
-      ticketRevenue,
-      coinRevenue,
-      pendingPayments,
-      successfulPayments,
-      cashCollected,
-      cashOrders,
-      packageStats: Array.from(packageMap.entries())
-        .map(([packageKey, packageData]) => ({
-          packageKey,
-          packageName: packageData.name,
-          ...packageData,
-        }))
-        .sort((a, b) => b.value - a.value),
-    };
-  }, [filteredOrders]);
+  const methodBreakdown = useMemo(
+    () => summary.by_payment_method.map((row) => ({ ...row, label: paymentMethodLabel(row.payment_method) })),
+    [summary.by_payment_method],
+  );
 
   const exportHeaders = [
     "Order ID",
@@ -433,6 +478,7 @@ export default function EventBookingReport() {
             : order,
         ),
       );
+      void fetchSummary();
       toast({
         title: "Payment Status Updated",
         description: SUCCESS_STATUSES.has(paymentStatus)
@@ -564,7 +610,7 @@ export default function EventBookingReport() {
         </div>
 
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" onClick={fetchOrders} disabled={isLoading}>
+          <Button variant="outline" size="sm" onClick={refreshAll} disabled={isLoading || isSummaryLoading}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Refresh
           </Button>
@@ -584,12 +630,16 @@ export default function EventBookingReport() {
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {[
-            { label: "Total Orders", value: stats.totalOrders.toString(), icon: Users },
-            { label: "Ticket revenue", value: formatEventPrice(stats.ticketRevenue), icon: Ticket },
-            { label: "Coin revenue", value: formatEventPrice(stats.coinRevenue), icon: Coins },
-            { label: `Cash collected (${stats.cashOrders} ${stats.cashOrders === 1 ? "order" : "orders"})`, value: formatEventPrice(stats.cashCollected), icon: Banknote },
-            { label: "Pending Payments", value: stats.pendingPayments.toString(), icon: Filter },
-            { label: "Successful Payments", value: stats.successfulPayments.toString(), icon: CheckCircle },
+            { label: "Total Orders", value: summary.total_orders.toString(), icon: Users },
+            { label: "Ticket revenue", value: formatEventPrice(summary.ticket_revenue_inr), icon: Ticket },
+            { label: "Coin revenue", value: formatEventPrice(summary.coin_revenue_inr), icon: Coins },
+            { label: "Total revenue (ticket + coin)", value: formatEventPrice(summary.recognised_revenue_inr), icon: Banknote },
+            {
+              label: `Pending Payments (${formatEventPrice(summary.pending_amount_inr)} on hold)`,
+              value: summary.pending_payments.toString(),
+              icon: Filter,
+            },
+            { label: "Successful Payments", value: summary.successful_payments.toString(), icon: CheckCircle },
           ].map((item) => {
             const Icon = item.icon;
             return (
@@ -598,35 +648,70 @@ export default function EventBookingReport() {
                   <span className="text-sm text-muted-foreground">{item.label}</span>
                   <Icon className="h-4 w-4 text-primary" />
                 </div>
-                <div className="mt-2 text-2xl font-bold">{isLoading ? "..." : item.value}</div>
+                <div className="mt-2 text-2xl font-bold">{isSummaryLoading ? "..." : item.value}</div>
               </div>
             );
           })}
         </div>
 
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Revenue by payment method</h3>
+            <span className="text-xs text-muted-foreground">
+              Breakdown of total revenue — cash, Razorpay and Cashfree add up to the total, they are not extra streams.
+            </span>
+          </div>
+          {methodBreakdown.length === 0 ? (
+            <div className="rounded-lg border bg-secondary/20 p-4 text-sm text-muted-foreground">
+              {isSummaryLoading ? "..." : "No payments for these filters."}
+            </div>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {methodBreakdown.map((row) => (
+                <div key={row.payment_method} className="rounded-lg border bg-secondary/20 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium">{row.label}</span>
+                    <Badge variant="outline">
+                      {row.paid_orders} paid / {row.orders} {row.orders === 1 ? "order" : "orders"}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 text-xl font-bold">{formatEventPrice(row.revenue_inr)}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {summary.recognised_revenue_inr > 0
+                      ? `${Math.round((row.revenue_inr / summary.recognised_revenue_inr) * 100)}% of total revenue`
+                      : "No recognised revenue yet"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
         <div className="grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
           <section className="space-y-3">
             <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Package-Wise Sales</h3>
-            {stats.packageStats.length === 0 ? (
-              <div className="rounded-lg border bg-secondary/20 p-4 text-sm text-muted-foreground">No package sales for these filters.</div>
+            {summary.by_package.length === 0 ? (
+              <div className="rounded-lg border bg-secondary/20 p-4 text-sm text-muted-foreground">
+                {isSummaryLoading ? "..." : "No package sales for these filters."}
+              </div>
             ) : (
-              stats.packageStats.map((packageData) => (
-                <div key={packageData.packageKey} className="rounded-lg border bg-secondary/20 p-4">
+              summary.by_package.map((packageData) => (
+                <div key={packageData.package_key} className="rounded-lg border bg-secondary/20 p-4">
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <div className="font-semibold">{packageData.packageName}</div>
-                      <div className="mt-1 text-sm text-muted-foreground">{getPackageCategoryLabel(packageData.category)}</div>
+                      <div className="font-semibold">{packageData.package_name}</div>
+                      <div className="mt-1 text-sm text-muted-foreground">{getPackageCategoryLabel(packageData.package_category)}</div>
                     </div>
                     <Badge variant="outline">Qty {packageData.quantity}</Badge>
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
                     <div>
                       <div className="text-muted-foreground">Booking Value</div>
-                      <div className="font-bold">{formatEventPrice(packageData.value)}</div>
+                      <div className="font-bold">{formatEventPrice(packageData.booking_value_inr)}</div>
                     </div>
                     <div>
                       <div className="text-muted-foreground">Revenue</div>
-                      <div className="font-bold text-success">{formatEventPrice(packageData.revenue)}</div>
+                      <div className="font-bold text-success">{formatEventPrice(packageData.revenue_inr)}</div>
                     </div>
                   </div>
                 </div>

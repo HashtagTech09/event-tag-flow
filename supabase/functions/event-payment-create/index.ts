@@ -9,6 +9,7 @@ import {
   makeCashfreeOrderId,
 } from "../_shared/cashfree.ts";
 import { validateCheckoutToken } from "../_shared/eventCheckout.ts";
+import { OrderPricingError, assertOrderPricedFromCatalog } from "../_shared/orderPricing.ts";
 import { createRazorpayOrder, getRazorpayConfig } from "../_shared/razorpay.ts";
 
 const BRAND_NAME = "Pink'd";
@@ -102,6 +103,11 @@ serve(async (req: Request) => {
 
     if (order.payment_provider === "cash") return jsonResponse({ error: "Cash bookings must be confirmed at Cash Desk" }, 409);
 
+    // The gateway amount comes from the catalog, never from the request body or a
+    // bare stored total: every line is re-priced from event_packages / coin_packages.
+    const pricing = await assertOrderPricedFromCatalog(supabase, order.id);
+    const amountInr = pricing.total_inr;
+
     const orderItems = Array.isArray(order.event_order_items) ? order.event_order_items as EventOrderItem[] : [];
     const itemsSummary = makeOrderItemSummary(orderItems);
     const coinSummary = makeCoinSummary(orderItems);
@@ -114,7 +120,7 @@ serve(async (req: Request) => {
           event_order_id: order.id,
           razorpay_order_id: order.razorpay_order_id,
           key_id: keyId,
-          amount_paise: Math.round(Number(order.total_amount_inr) * 100),
+          amount_paise: Math.round(amountInr * 100),
           currency: "INR",
           customer: {
             name: order.customer_name,
@@ -127,7 +133,7 @@ serve(async (req: Request) => {
 
       const razorpayOrder = await createRazorpayOrder({
         eventOrderId: order.id,
-        amountInr: Number(order.total_amount_inr),
+        amountInr,
         customerName: order.customer_name,
         customerEmail: order.customer_email,
         customerPhone: order.customer_phone,
@@ -191,7 +197,7 @@ serve(async (req: Request) => {
       },
       body: JSON.stringify({
         order_id: cashfreeOrderId,
-        order_amount: Number(order.total_amount_inr),
+        order_amount: amountInr,
         order_currency: "INR",
         customer_details: {
           customer_id: order.id,
@@ -243,6 +249,10 @@ serve(async (req: Request) => {
       mode: config.mode,
     });
   } catch (error) {
+    if (error instanceof OrderPricingError) {
+      console.warn("event-payment-create refused: order pricing mismatch", { code: error.code });
+      return jsonResponse({ error: error.message, code: error.code }, error.status);
+    }
     console.error("event-payment-create failed:", error);
     return jsonResponse({ error: error instanceof Error ? error.message : "Payment setup failed" }, 500);
   }

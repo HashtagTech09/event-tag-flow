@@ -2,6 +2,7 @@ import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.56.0";
 import { corsHeaders, getSupabaseAdmin, jsonResponse } from "../_shared/cashfree.ts";
 import { renderTicketEmail, type EventOrder } from "../_shared/eventEmail.ts";
+import { priceOrderFromCatalog } from "../_shared/orderPricing.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALERT_TO = ["manas210890@gmail.com", "ayushi.pathania@gmail.com"];
@@ -106,6 +107,12 @@ serve(async (req: Request) => {
       return jsonResponse(data?.result || { status: "not_recorded" });
     }
     let result: Record<string, unknown> = { status: "succeeded" };
+    // Cash is collected against the catalog price: refuse to issue a code or
+    // confirm cash for an order whose stored amount no longer matches it.
+    if (["request_code", "confirm"].includes(action)) {
+      const pricing = await priceOrderFromCatalog(admin, orderId);
+      if (!pricing.ok) return jsonResponse({ status: "rejected", error: pricing.reason, code: pricing.code }, pricing.code === "not_found" ? 404 : 200);
+    }
     if (action !== "retry_notifications") {
       const code = action === "request_code" ? await codeFor(orderId, operationId) : String(body.code || "");
       if (action === "confirm" && !/^\d{6}$/.test(code)) return jsonResponse({ error: "Enter the six-digit code" }, 400);
